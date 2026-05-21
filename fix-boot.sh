@@ -1,22 +1,8 @@
 #!/usr/bin/env bash
-# AegisOS — fix unbootable install (UEFI fallback path repair).
-#
-# The manual installer used grub-install --bootloader-id=AegisOS which puts
-# the bootloader at /EFI/AegisOS/grubx64.efi. VMware Fusion's UEFI firmware
-# doesn't reliably honor NVRAM entries and falls back to looking for
-# /EFI/BOOT/BOOTX64.EFI ("removable media" path). When that path is empty,
-# you get exactly what you described: black screen with blinking logo, then
-# back to the boot manager.
-#
-# This script: boots back into the live session, mounts your installed disk,
-# chroots in, and re-runs grub-install with --removable AND keeps the
-# AegisOS entry too. Belt and suspenders.
-#
-# How to use:
-#   1. In VMware Fusion: Virtual Machine → CD/DVD → connect the AegisOS ISO
-#   2. Restart, boot the live "Try AegisOS" entry
-#   3. From the live desktop, drag this file into the VM (same as before)
-#   4. Open LXTerminal and run:  sudo bash /tmp/fix-boot.sh
+# AegisOS — fix-boot.sh v2
+# Fixes v1 bugs: uses `lsblk -lnpo` so partition names don't have tree-drawing
+# chars like "├─sda1"; cleans up leftover mounts from previous failed run;
+# trap unmounts on any exit; verifies each mount before continuing.
 
 set -euo pipefail
 
@@ -28,156 +14,130 @@ header() { printf '\n\033[1;36m══ %s ══\033[0m\n' "$*"; }
 die()    { red "$*"; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Run with sudo: sudo bash $0"
+[[ -d /cdrom/casper ]] || die "Must run from AegisOS live session (boot from ISO first)."
 
-# Verify we're in the LIVE session, not the broken installed system
-if [[ ! -d /cdrom/casper ]]; then
-    die "This script must run from the AegisOS LIVE session (booted from ISO).
-You're currently in something else. Connect the ISO in VMware Fusion's
-CD/DVD menu, restart, and pick 'Try AegisOS' at the GRUB menu."
-fi
+MOUNT_DIR=/mnt/aegisos
+
+cleanup() {
+    set +e
+    mountpoint -q "$MOUNT_DIR/sys/firmware/efi/efivars" && umount "$MOUNT_DIR/sys/firmware/efi/efivars" 2>/dev/null
+    mountpoint -q "$MOUNT_DIR/dev/pts" && umount "$MOUNT_DIR/dev/pts" 2>/dev/null
+    for d in dev proc sys run; do
+        mountpoint -q "$MOUNT_DIR/$d" && { umount "$MOUNT_DIR/$d" 2>/dev/null || umount -lf "$MOUNT_DIR/$d" 2>/dev/null; }
+    done
+    mountpoint -q "$MOUNT_DIR/boot/efi" && umount "$MOUNT_DIR/boot/efi" 2>/dev/null
+    mountpoint -q "$MOUNT_DIR" && umount "$MOUNT_DIR" 2>/dev/null
+}
+trap cleanup EXIT
+
+cleanup
+sleep 1
 
 header "Finding installed AegisOS partition"
 
-# The installed AegisOS root has filesystem label "AegisOS" (we set it with
-# mkfs.ext4 -L AegisOS in manual-install.sh)
-ROOT_PART=$(blkid -L AegisOS 2>/dev/null || true)
-
-if [[ -z "$ROOT_PART" ]]; then
-    yellow "No partition labeled AegisOS found. Looking for any ext4 partition..."
-    # Fallback: largest ext4 partition that's not the live medium
-    while read -r part fstype; do
-        [[ "$fstype" == "ext4" ]] || continue
-        # Skip live medium
-        mountpoint -q "/dev/$part" 2>/dev/null && continue
-        ROOT_PART="/dev/$part"
-        blue "Candidate root: $ROOT_PART"
-    done < <(lsblk -n -o NAME,FSTYPE | grep -E '^[a-z]+[0-9]+|^nvme[0-9]+n[0-9]+p[0-9]+')
-
-    [[ -n "$ROOT_PART" ]] || die "No ext4 partition found. Did the install actually run?"
-fi
+ROOT_PART="$(blkid -L AegisOS 2>/dev/null || true)"
+[[ -n "$ROOT_PART" ]] || die "No partition labeled 'AegisOS' found. Did manual-install.sh finish?"
 blue "Root partition: $ROOT_PART"
 
-# Find the disk this partition is on, and its ESP
-PARENT_DISK=$(lsblk -no PKNAME "$ROOT_PART")
-[[ -n "$PARENT_DISK" ]] || die "Can't find parent disk of $ROOT_PART"
+PARENT_DISK="$(lsblk -no PKNAME "$ROOT_PART" | head -1)"
+[[ -n "$PARENT_DISK" ]] || die "Could not find parent disk of $ROOT_PART"
 PARENT_DISK="/dev/$PARENT_DISK"
-blue "Parent disk: $PARENT_DISK"
+blue "Parent disk:    $PARENT_DISK"
 
+# Find EFI partition using lsblk -l (list mode = NO tree-drawing chars)
 EFI_PART=""
-while read -r part fstype; do
+while read -r part fstype rest; do
+    [[ "$part" == "$PARENT_DISK" ]] && continue
     if [[ "$fstype" == "vfat" ]]; then
-        EFI_PART="/dev/$part"
+        EFI_PART="$part"
         break
     fi
-done < <(lsblk -n -o NAME,FSTYPE "$PARENT_DISK" | tail -n +2)
+done < <(lsblk -lnpo NAME,FSTYPE "$PARENT_DISK")
 
 if [[ -n "$EFI_PART" ]]; then
-    blue "EFI partition: $EFI_PART"
+    blue "EFI partition:  $EFI_PART"
     BOOT_MODE=UEFI
 else
-    blue "No EFI partition — assuming BIOS install"
+    blue "No vfat partition on $PARENT_DISK → BIOS install"
     BOOT_MODE=BIOS
 fi
 
-header "Mounting installed system"
-mkdir -p /mnt/aegisos
-mount "$ROOT_PART" /mnt/aegisos
-green "Mounted $ROOT_PART at /mnt/aegisos"
-
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    mkdir -p /mnt/aegisos/boot/efi
-    mount "$EFI_PART" /mnt/aegisos/boot/efi
-    green "Mounted $EFI_PART at /mnt/aegisos/boot/efi"
+if [[ "$BOOT_MODE" == "UEFI" ]] && [[ ! -b "$EFI_PART" ]]; then
+    die "EFI device $EFI_PART doesn't exist. Run: lsblk -lnpo NAME,FSTYPE $PARENT_DISK"
 fi
 
-# Bind mounts for chroot
-for d in dev proc sys run; do
-    mount --bind /$d /mnt/aegisos/$d
-done
-mount --bind /dev/pts /mnt/aegisos/dev/pts
-[[ -d /sys/firmware/efi/efivars ]] && \
-    mount --bind /sys/firmware/efi/efivars /mnt/aegisos/sys/firmware/efi/efivars 2>/dev/null || true
-
-cp /etc/resolv.conf /mnt/aegisos/etc/resolv.conf 2>/dev/null || true
-
-header "Reinstalling GRUB ($BOOT_MODE mode, with removable-media fallback)"
+header "Mounting installed system"
+mkdir -p "$MOUNT_DIR"
+mount "$ROOT_PART" "$MOUNT_DIR"
+mountpoint -q "$MOUNT_DIR" || die "Root mount failed"
+green "✓ $ROOT_PART → $MOUNT_DIR"
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    chroot /mnt/aegisos /bin/bash -c "
-        set -e
-        # Make sure grub packages are present
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall \
-            grub-efi-amd64 grub-efi-amd64-bin grub-efi-amd64-signed \
-            shim-signed efibootmgr 2>&1 | tail -5
+    mkdir -p "$MOUNT_DIR/boot/efi"
+    mount "$EFI_PART" "$MOUNT_DIR/boot/efi"
+    mountpoint -q "$MOUNT_DIR/boot/efi" || die "ESP mount failed"
+    green "✓ $EFI_PART → $MOUNT_DIR/boot/efi"
+    echo
+    echo "Contents of ESP before fix:"
+    find "$MOUNT_DIR/boot/efi/EFI" -maxdepth 2 2>/dev/null | sed 's|^|  |' || true
+fi
 
-        # Install GRUB to /EFI/AegisOS/ AND to the fallback /EFI/BOOT/ path
-        # The --removable flag forces install to /EFI/BOOT/BOOTX64.EFI, which
-        # is what VMware Fusion's UEFI looks for when NVRAM entries fail.
-        grub-install --target=x86_64-efi --efi-directory=/boot/efi --recheck \
-            --bootloader-id=AegisOS
-        grub-install --target=x86_64-efi --efi-directory=/boot/efi --recheck \
-            --removable
+for d in dev proc sys run; do
+    mount --bind "/$d" "$MOUNT_DIR/$d"
+done
+mount --bind /dev/pts "$MOUNT_DIR/dev/pts"
+[[ -d /sys/firmware/efi/efivars ]] && \
+    mount --bind /sys/firmware/efi/efivars "$MOUNT_DIR/sys/firmware/efi/efivars" 2>/dev/null || true
+cp /etc/resolv.conf "$MOUNT_DIR/etc/resolv.conf" 2>/dev/null || true
 
+header "Reinstalling GRUB ($BOOT_MODE)"
+
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
+    chroot "$MOUNT_DIR" /bin/bash -e -c '
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y --reinstall grub-efi-amd64 grub-efi-amd64-bin efibootmgr 2>&1 | tail -3 || true
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=AegisOS --recheck
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck
         update-grub
-    "
-    green "GRUB installed at BOTH /EFI/AegisOS/ AND /EFI/BOOT/ (fallback)"
+    '
+    green "✓ GRUB written to BOTH /EFI/AegisOS/ AND /EFI/BOOT/"
+    echo
+    echo "Contents of ESP after fix:"
+    find "$MOUNT_DIR/boot/efi/EFI" -maxdepth 2 \( -type d -o -name '*.EFI' -o -name '*.efi' \) 2>/dev/null | sed 's|^|  |'
 
-    # Verify the fallback path actually has the file
-    if [[ -f /mnt/aegisos/boot/efi/EFI/BOOT/BOOTX64.EFI ]]; then
-        green "✓ /boot/efi/EFI/BOOT/BOOTX64.EFI exists"
-        ls -la /mnt/aegisos/boot/efi/EFI/BOOT/
+    if [[ -f "$MOUNT_DIR/boot/efi/EFI/BOOT/BOOTX64.EFI" ]]; then
+        size=$(stat -c%s "$MOUNT_DIR/boot/efi/EFI/BOOT/BOOTX64.EFI")
+        green "✓ /EFI/BOOT/BOOTX64.EFI exists ($size bytes)"
     else
-        yellow "⚠ Fallback BOOTX64.EFI missing — copying manually as last resort"
-        mkdir -p /mnt/aegisos/boot/efi/EFI/BOOT
-        cp /mnt/aegisos/boot/efi/EFI/AegisOS/grubx64.efi \
-           /mnt/aegisos/boot/efi/EFI/BOOT/BOOTX64.EFI
-        # Also need shim if it exists
-        [[ -f /mnt/aegisos/boot/efi/EFI/AegisOS/shimx64.efi ]] && \
-            cp /mnt/aegisos/boot/efi/EFI/AegisOS/shimx64.efi \
-               /mnt/aegisos/boot/efi/EFI/BOOT/BOOTX64.EFI
+        yellow "Fallback path missing — copying manually"
+        mkdir -p "$MOUNT_DIR/boot/efi/EFI/BOOT"
+        cp "$MOUNT_DIR/boot/efi/EFI/AegisOS/grubx64.efi" "$MOUNT_DIR/boot/efi/EFI/BOOT/BOOTX64.EFI"
+        green "✓ Copied AegisOS/grubx64.efi → BOOT/BOOTX64.EFI"
     fi
 else
-    chroot /mnt/aegisos /bin/bash -c "
-        set -e
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall grub-pc 2>&1 | tail -3
+    chroot "$MOUNT_DIR" /bin/bash -e -c "
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y --reinstall grub-pc 2>&1 | tail -3 || true
         grub-install --target=i386-pc --recheck '$PARENT_DISK'
         update-grub
     "
-    green "GRUB reinstalled to MBR of $PARENT_DISK"
+    green "✓ GRUB written to MBR of $PARENT_DISK"
 fi
 
-# Verify grub.cfg actually got generated with valid menu entries
-header "Verifying grub config"
-if [[ -f /mnt/aegisos/boot/grub/grub.cfg ]]; then
-    MENU_COUNT=$(grep -c '^menuentry ' /mnt/aegisos/boot/grub/grub.cfg || echo 0)
-    blue "Menu entries in grub.cfg: $MENU_COUNT"
-    if [[ $MENU_COUNT -lt 1 ]]; then
-        yellow "WARNING: no menu entries — grub will boot to a prompt."
-        yellow "Inside the chroot, manually run:  update-grub"
-    else
-        green "grub.cfg looks healthy"
-        grep '^menuentry ' /mnt/aegisos/boot/grub/grub.cfg | head -3 | sed 's/^/  /'
-    fi
+header "Verifying grub.cfg"
+if [[ -f "$MOUNT_DIR/boot/grub/grub.cfg" ]]; then
+    count=$(grep -c '^menuentry ' "$MOUNT_DIR/boot/grub/grub.cfg" || echo 0)
+    blue "Menu entries: $count"
+    grep '^menuentry ' "$MOUNT_DIR/boot/grub/grub.cfg" | head -3 | sed 's|^|  |'
 else
-    yellow "WARNING: /boot/grub/grub.cfg does not exist!"
+    red "✗ /boot/grub/grub.cfg missing!"
 fi
 
-header "Cleanup"
-umount /mnt/aegisos/sys/firmware/efi/efivars 2>/dev/null || true
-umount /mnt/aegisos/dev/pts
-for d in dev proc sys run; do
-    umount /mnt/aegisos/$d 2>/dev/null || umount -lf /mnt/aegisos/$d
-done
-[[ "$BOOT_MODE" == "UEFI" ]] && umount /mnt/aegisos/boot/efi
-umount /mnt/aegisos
-sync
-
 green ""
-green "═══════════════════════════════════════════════════════════════"
-green "  GRUB repaired."
-green ""
-green "  Next:"
-green "    1. In VMware Fusion: Virtual Machine → CD/DVD → DISCONNECT the ISO"
-green "    2. Power off the VM (do NOT just reboot — full power cycle)"
-green "    3. Power on. AegisOS should boot from disk now."
-green "═══════════════════════════════════════════════════════════════"
+green "════════════════════════════════════════════════════════════════"
+green "  GRUB repair complete."
+green "  Now:"
+green "    1. VMware Fusion: Virtual Machine → CD/DVD → DISCONNECT"
+green "    2. VMware Fusion: Virtual Machine → SHUT DOWN (not restart)"
+green "    3. Start the VM again. AegisOS should boot from disk."
+green "════════════════════════════════════════════════════════════════"
